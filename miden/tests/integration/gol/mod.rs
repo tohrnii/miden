@@ -20,8 +20,8 @@ proptest! {
             // run it in rust
             let expected_outputs = to_1d(gol(&to_2d(inputs, 4)));
             // compare
-            assert_eq!(program_outputs.stack(), expected_outputs);
-            inputs = program_outputs.stack().to_vec();
+            assert_eq!(&program_outputs.stack()[..16], expected_outputs);
+            inputs = program_outputs.stack()[..16].to_vec();
         }
         
     }
@@ -59,7 +59,7 @@ fn gol(grid: &Vec<Vec<i8>>) -> Vec<Vec<i8>> {
                     let new_y = (j as i8) + y;
 
                     // make sure the position is within the bounds of the grid
-                    if new_x > 0 && new_y > 0 && new_x < n as i8 && new_y < m as i8 {
+                    if new_x >= 0 && new_y >= 0 && new_x < n as i8 && new_y < m as i8 {
                         live_neighbors += grid[new_x as usize][new_y as usize];
                     }
                 }
