@@ -1,3 +1,5 @@
+use self::hasher::HasherLookup;
+
 use super::{
     BTreeMap, ChipletsTrace, Felt, FieldElement, RangeChecker, StarkField, TraceFragment, Vec,
     Word, CHIPLETS_WIDTH, ONE, ZERO,
@@ -99,8 +101,12 @@ impl Chiplets {
     /// The returned tuple contains the hasher state after the permutation and the row address of
     /// the execution trace at which the permutation started.
     pub fn permute(&mut self, state: HasherState) -> (Felt, HasherState) {
-        let (addr, return_state, lookups) = self.hasher.permute(state);
-        self.bus.request_hasher_operation(lookups, self.clk);
+        let mut lookups = Vec::new();
+        let (addr, return_state) = self.hasher.permute(state, &mut lookups);
+        self.bus.request_hasher_operation(&lookups, self.clk);
+
+        // provide the responses to the bus
+        self.provide_hasher_lookups(&lookups);
 
         (addr, return_state)
     }
@@ -116,8 +122,15 @@ impl Chiplets {
     /// - The provided path does not contain any nodes.
     /// - The provided index is out of range for the specified path.
     pub fn build_merkle_root(&mut self, value: Word, path: &[Word], index: Felt) -> (Felt, Word) {
-        let (addr, root, lookups) = self.hasher.build_merkle_root(value, path, index);
-        self.bus.request_hasher_operation(lookups, self.clk);
+        let mut lookups = Vec::new();
+        let (addr, root) = self
+            .hasher
+            .build_merkle_root(value, path, index, &mut lookups);
+
+        self.bus.request_hasher_operation(&lookups, self.clk);
+
+        // provide the responses to the bus
+        self.provide_hasher_lookups(&lookups);
 
         (addr, root)
     }
@@ -139,10 +152,14 @@ impl Chiplets {
         path: &[Word],
         index: Felt,
     ) -> (Felt, Word, Word) {
-        let (addr, old_root, new_root, lookups) = self
-            .hasher
-            .update_merkle_root(old_value, new_value, path, index);
-        self.bus.request_hasher_operation(lookups, self.clk);
+        let mut lookups = Vec::new();
+        let (addr, old_root, new_root) =
+            self.hasher
+                .update_merkle_root(old_value, new_value, path, index, &mut lookups);
+        self.bus.request_hasher_operation(&lookups, self.clk);
+
+        // provide the responses to the bus
+        self.provide_hasher_lookups(&lookups);
 
         (addr, old_root, new_root)
     }
@@ -155,7 +172,10 @@ impl Chiplets {
     ///
     /// It returns the row address of the execution trace at which the hash computation started.
     pub fn hash_control_block(&mut self, h1: Word, h2: Word, expected_hash: Digest) -> Felt {
-        let (addr, result, lookups) = self.hasher.hash_control_block(h1, h2, expected_hash);
+        let mut lookups = Vec::new();
+        let (addr, result) = self
+            .hasher
+            .hash_control_block(h1, h2, expected_hash, &mut lookups);
 
         // make sure the result computed by the hasher is the same as the expected block hash
         debug_assert_eq!(expected_hash, result.into());
@@ -165,6 +185,9 @@ impl Chiplets {
 
         // enqueue the request for the hash result
         self.bus.enqueue_hasher_request(lookups[1]);
+
+        // provide the responses to the bus
+        self.provide_hasher_lookups(&lookups);
 
         addr
     }
@@ -179,9 +202,10 @@ impl Chiplets {
         num_op_groups: usize,
         expected_hash: Digest,
     ) -> Felt {
-        let (addr, result, lookups) =
+        let mut lookups = Vec::new();
+        let (addr, result) =
             self.hasher
-                .hash_span_block(op_batches, num_op_groups, expected_hash);
+                .hash_span_block(op_batches, num_op_groups, expected_hash, &mut lookups);
 
         // make sure the result computed by the hasher is the same as the expected block hash
         debug_assert_eq!(expected_hash, result.into());
@@ -194,6 +218,9 @@ impl Chiplets {
         for lookup in lookups.iter().skip(1).rev() {
             self.bus.enqueue_hasher_request(*lookup);
         }
+
+        // provide the responses to the bus
+        self.provide_hasher_lookups(&lookups);
 
         addr
     }
@@ -217,6 +244,16 @@ impl Chiplets {
     /// lookup for returning a hash result.
     pub fn read_hash_result(&mut self) {
         self.bus.send_queued_hasher_request(self.clk);
+    }
+
+    // HASH CHIPLET HELPERS
+    // --------------------------------------------------------------------------------------------
+
+    /// Provides hasher lookups to the bus
+    fn provide_hasher_lookups(&mut self, lookups: &[HasherLookup]) {
+        for lookup in lookups.iter() {
+            self.bus.provide_hasher_lookup(*lookup, lookup.cycle());
+        }
     }
 
     // BITWISE CHIPLET ACCESSORS

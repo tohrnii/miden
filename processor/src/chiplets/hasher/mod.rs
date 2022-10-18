@@ -76,16 +76,11 @@ mod tests;
 pub struct Hasher {
     trace: HasherTrace,
     aux_trace: AuxTraceBuilder,
-    // TODO: Investigate optimization options, since these lookups are also stored in the bus.
-    // - The Hasher could "provide" lookups immediately instead of storing them and providing them
-    //    during `fill_trace`.
-    // There are probably other options as well, so this should be investigated & benchmarked.
-    lookups: Vec<HasherLookup>,
     memoized_trace_map: BTreeMap<[u8; 32], (usize, usize)>,
 }
 
 impl Hasher {
-    // PUBLIC ACCESSORS
+    // STATE ACCESSORS
     // --------------------------------------------------------------------------------------------
 
     /// Returns current length of the execution trace stored in this hasher.
@@ -93,46 +88,14 @@ impl Hasher {
         self.trace.trace_len()
     }
 
-    // STATE MUTATORS
-    // --------------------------------------------------------------------------------------------
-
-    /// Records a HasherLookup with the specified data.
-    ///
-    /// When starting a hash operation, it should be called before any rows are recorded in the
-    /// trace. In all other cases, it should be called immediately after the corresponding row is
-    /// appended to the trace, so that the address of the row is equal to the trace length.
-    fn append_lookup(&mut self, label: u8, index: Felt, context: HasherLookupContext) {
-        let addr = match context {
+    /// Returns the row address for the lookup based on its context.
+    fn get_lookup_addr(&self, context: HasherLookupContext) -> u32 {
+        match context {
             // when starting a new hash operation, lookups are added before the operation begins.
             HasherLookupContext::Start => self.trace.next_row_addr().as_int() as u32,
             // in all other cases, they are added after the hash operation has completed.
             _ => self.trace_len() as u32,
-        };
-
-        self.lookups
-            .push(HasherLookup::new(label, addr, index, context));
-    }
-
-    /// Records a HasherLookup with the specified data at the specified row address.
-    fn append_lookup_at(
-        &mut self,
-        addr: usize,
-        label: u8,
-        index: Felt,
-        context: HasherLookupContext,
-    ) {
-        self.lookups
-            .push(HasherLookup::new(label, addr as u32, index, context));
-    }
-
-    /// Returns the index at which the next lookup will be appended.
-    fn next_lookup_idx(&self) -> usize {
-        self.lookups.len()
-    }
-
-    /// Gets all of the most recently recorded lookups, starting from `start_index`.
-    fn get_last_lookups(&self, start_index: usize) -> &[HasherLookup] {
-        &self.lookups[start_index..]
+        }
     }
 
     // HASHING METHODS
@@ -149,22 +112,27 @@ impl Hasher {
     pub(super) fn permute(
         &mut self,
         mut state: HasherState,
-    ) -> (Felt, HasherState, &[HasherLookup]) {
+        lookups: &mut Vec<HasherLookup>,
+    ) -> (Felt, HasherState) {
         let addr = self.trace.next_row_addr();
-        let init_lookup_idx = self.next_lookup_idx();
 
         // add the lookup for the hash initialization.
-        self.append_lookup(LINEAR_HASH_LABEL, ZERO, HasherLookupContext::Start);
+        let context = HasherLookupContext::Start;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_start = HasherLookup::new(LINEAR_HASH_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_start);
 
         // perform the hash.
         self.trace
             .append_permutation(&mut state, LINEAR_HASH, RETURN_STATE);
 
         // add the lookup for the hash result.
-        self.append_lookup(RETURN_STATE_LABEL, ZERO, HasherLookupContext::Return);
+        let context = HasherLookupContext::Return;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_end = HasherLookup::new(RETURN_HASH_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_end);
 
-        let lookups = self.get_last_lookups(init_lookup_idx);
-        (addr, state, lookups)
+        (addr, state)
     }
 
     /// Computes the hash of the control block by computing hash(h1, h2) and returns the result.
@@ -180,13 +148,16 @@ impl Hasher {
         h1: Word,
         h2: Word,
         expected_hash: Digest,
-    ) -> (Felt, Word, &[HasherLookup]) {
+        lookups: &mut Vec<HasherLookup>,
+    ) -> (Felt, Word) {
         let addr = self.trace.next_row_addr();
-        let init_lookup_idx = self.next_lookup_idx();
         let mut state = init_state_from_words(&h1, &h2);
 
         // add the lookup for the hash initialization.
-        self.append_lookup(LINEAR_HASH_LABEL, ZERO, HasherLookupContext::Start);
+        let context = HasherLookupContext::Start;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_start = HasherLookup::new(LINEAR_HASH_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_start);
 
         if let Some((start_row, end_row)) = self.get_memoized_trace(expected_hash) {
             // copy the trace of a block with same hash instead of building it again.
@@ -200,12 +171,14 @@ impl Hasher {
         };
 
         // add the lookup for the hash result.
-        self.append_lookup(RETURN_HASH_LABEL, ZERO, HasherLookupContext::Return);
+        let context = HasherLookupContext::Return;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_end = HasherLookup::new(RETURN_HASH_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_end);
 
         let result = get_digest(&state);
-        let lookups = self.get_last_lookups(init_lookup_idx);
 
-        (addr, result, lookups)
+        (addr, result)
     }
 
     /// Computes a sequential hash of all operation batches in the list and returns the result. It
@@ -221,7 +194,8 @@ impl Hasher {
         op_batches: &[OpBatch],
         num_op_groups: usize,
         expected_hash: Digest,
-    ) -> (Felt, Word, &[HasherLookup]) {
+        lookups: &mut Vec<HasherLookup>,
+    ) -> (Felt, Word) {
         const START: Selectors = LINEAR_HASH;
         const START_LABEL: u8 = LINEAR_HASH_LABEL;
         const RETURN: Selectors = RETURN_HASH;
@@ -236,13 +210,15 @@ impl Hasher {
         const CONTINUE: Selectors = [ZERO, LINEAR_HASH[1], LINEAR_HASH[2]];
 
         let addr = self.trace.next_row_addr();
-        let init_lookup_idx = self.next_lookup_idx();
 
         // initialize the state and absorb the first operation batch into it
         let mut state = init_state(op_batches[0].groups(), num_op_groups);
 
         // add the lookup for the hash initialization.
-        self.append_lookup(START_LABEL, ZERO, HasherLookupContext::Start);
+        let context = HasherLookupContext::Start;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_start = HasherLookup::new(START_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_start);
 
         // check if a span block with same hash has been encountered before in which case we can
         // directly copy it's trace.
@@ -275,14 +251,24 @@ impl Hasher {
 
                 for batch in op_batches.iter().take(num_batches - 1).skip(1) {
                     absorb_into_state(&mut state, batch.groups());
+
                     // add the lookup for absorbing the next operation batch.
-                    self.append_lookup(ABSORB_LABEL, ZERO, HasherLookupContext::Absorb);
+                    let context = HasherLookupContext::Absorb;
+                    let lookup_addr = self.get_lookup_addr(context);
+                    let lookup = HasherLookup::new(ABSORB_LABEL, lookup_addr, ZERO, context);
+                    lookups.push(lookup);
+
                     self.trace.append_permutation(&mut state, CONTINUE, ABSORB);
                 }
 
                 absorb_into_state(&mut state, op_batches[num_batches - 1].groups());
+
                 // add the lookup for absorbing the final operation batch.
-                self.append_lookup(ABSORB_LABEL, ZERO, HasherLookupContext::Absorb);
+                let context = HasherLookupContext::Absorb;
+                let lookup_addr = self.get_lookup_addr(context);
+                let lookup = HasherLookup::new(ABSORB_LABEL, lookup_addr, ZERO, context);
+                lookups.push(lookup);
+
                 self.trace.append_permutation(&mut state, CONTINUE, RETURN);
             }
             self.insert_to_memoized_trace_map(addr, expected_hash);
@@ -292,26 +278,30 @@ impl Hasher {
             for i in 1..num_batches - 1 {
                 // add the lookup for absorbing the next operation batch. Here we add the
                 // lookups before actually copying the memoized trace.
-                self.append_lookup_at(
-                    self.trace_len() + i * HASH_CYCLE_LEN,
-                    ABSORB_LABEL,
-                    ZERO,
-                    HasherLookupContext::Absorb,
-                );
+                let context = HasherLookupContext::Absorb;
+                let lookup_addr = self.trace_len() + i * HASH_CYCLE_LEN;
+                let lookup = HasherLookup::new(ABSORB_LABEL, lookup_addr as u32, ZERO, context);
+                lookups.push(lookup);
             }
 
             self.trace.copy_trace(&mut state, start_row..end_row);
+
             // add the lookup for absorbing the final operation batch.
-            self.append_lookup(ABSORB_LABEL, ZERO, HasherLookupContext::Absorb);
+            let context = HasherLookupContext::Absorb;
+            let lookup_addr = self.get_lookup_addr(context);
+            let lookup = HasherLookup::new(ABSORB_LABEL, lookup_addr, ZERO, context);
+            lookups.push(lookup);
         }
 
         // add the lookup for the hash result.
-        self.append_lookup(RETURN_LABEL, ZERO, HasherLookupContext::Return);
+        let context = HasherLookupContext::Return;
+        let lookup_addr = self.get_lookup_addr(context);
+        let lookup_end = HasherLookup::new(RETURN_LABEL, lookup_addr, ZERO, context);
+        lookups.push(lookup_end);
 
         let result = get_digest(&state);
-        let lookups = self.get_last_lookups(init_lookup_idx);
 
-        (addr, result, lookups)
+        (addr, result)
     }
 
     /// Performs Merkle path verification computation and records its execution trace, as well as
@@ -334,15 +324,19 @@ impl Hasher {
         value: Word,
         path: &[Word],
         index: Felt,
-    ) -> (Felt, Word, &[HasherLookup]) {
+        lookups: &mut Vec<HasherLookup>,
+    ) -> (Felt, Word) {
         let addr = self.trace.next_row_addr();
-        let init_lookup_idx = self.next_lookup_idx();
 
-        let root =
-            self.verify_merkle_path(value, path, index.as_int(), MerklePathContext::MpVerify);
+        let root = self.verify_merkle_path(
+            value,
+            path,
+            index.as_int(),
+            MerklePathContext::MpVerify,
+            lookups,
+        );
 
-        let lookups = self.get_last_lookups(init_lookup_idx);
-        (addr, root, lookups)
+        (addr, root)
     }
 
     /// Performs Merkle root update computation and records its execution trace, as well as the
@@ -368,18 +362,27 @@ impl Hasher {
         new_value: Word,
         path: &[Word],
         index: Felt,
-    ) -> (Felt, Word, Word, &[HasherLookup]) {
+        lookups: &mut Vec<HasherLookup>,
+    ) -> (Felt, Word, Word) {
         let addr = self.trace.next_row_addr();
-        let init_lookup_idx = self.next_lookup_idx();
         let index = index.as_int();
 
-        let old_root =
-            self.verify_merkle_path(old_value, path, index, MerklePathContext::MrUpdateOld);
-        let new_root =
-            self.verify_merkle_path(new_value, path, index, MerklePathContext::MrUpdateNew);
+        let old_root = self.verify_merkle_path(
+            old_value,
+            path,
+            index,
+            MerklePathContext::MrUpdateOld,
+            lookups,
+        );
+        let new_root = self.verify_merkle_path(
+            new_value,
+            path,
+            index,
+            MerklePathContext::MrUpdateNew,
+            lookups,
+        );
 
-        let lookups = self.get_last_lookups(init_lookup_idx);
-        (addr, old_root, new_root, lookups)
+        (addr, old_root, new_root)
     }
 
     // TRACE GENERATION
@@ -391,12 +394,12 @@ impl Hasher {
     pub(super) fn fill_trace(
         self,
         trace: &mut TraceFragment,
-        chiplets_bus: &mut ChipletsBus,
+        _chiplets_bus: &mut ChipletsBus,
     ) -> AuxTraceBuilder {
         // provide all lookups to the ChipletsBus.
-        for lookup in self.lookups {
-            chiplets_bus.provide_hasher_lookup(lookup, lookup.cycle() as u32);
-        }
+        // for lookup in self.lookups {
+        //     chiplets_bus.provide_hasher_lookup(lookup, lookup.cycle());
+        // }
         // fill the trace.
         self.trace.fill_trace(trace);
 
@@ -422,6 +425,7 @@ impl Hasher {
         path: &[Word],
         mut index: u64,
         context: MerklePathContext,
+        lookups: &mut Vec<HasherLookup>,
     ) -> Word {
         assert!(!path.is_empty(), "path is empty");
         assert!(index >> path.len() == 0, "invalid index for the path");
@@ -436,27 +440,54 @@ impl Hasher {
             // handle path of length 1 separately because pattern for init and final selectors
             // is different from other cases
             self.update_sibling_hints(context, index, path[0], depth);
-            self.verify_mp_leg(root, path[0], &mut index, main_selectors, RETURN_HASH)
+            self.verify_mp_leg(
+                root,
+                path[0],
+                &mut index,
+                main_selectors,
+                RETURN_HASH,
+                lookups,
+            )
         } else {
             // process the first node of the path; for this node, init and final selectors are
             // the same
             let sibling = path[0];
             self.update_sibling_hints(context, index, sibling, depth);
-            root = self.verify_mp_leg(root, sibling, &mut index, main_selectors, main_selectors);
+            root = self.verify_mp_leg(
+                root,
+                sibling,
+                &mut index,
+                main_selectors,
+                main_selectors,
+                lookups,
+            );
             depth -= 1;
 
             // process all other nodes, except for the last one
             for &sibling in &path[1..path.len() - 1] {
                 self.update_sibling_hints(context, index, sibling, depth);
-                root =
-                    self.verify_mp_leg(root, sibling, &mut index, part_selectors, main_selectors);
+                root = self.verify_mp_leg(
+                    root,
+                    sibling,
+                    &mut index,
+                    part_selectors,
+                    main_selectors,
+                    lookups,
+                );
                 depth -= 1;
             }
 
             // process the last node
             let sibling = path[path.len() - 1];
             self.update_sibling_hints(context, index, sibling, depth);
-            self.verify_mp_leg(root, sibling, &mut index, part_selectors, RETURN_HASH)
+            self.verify_mp_leg(
+                root,
+                sibling,
+                &mut index,
+                part_selectors,
+                RETURN_HASH,
+                lookups,
+            )
         }
     }
 
@@ -478,6 +509,7 @@ impl Hasher {
         index: &mut u64,
         init_selectors: Selectors,
         final_selectors: Selectors,
+        lookups: &mut Vec<HasherLookup>,
     ) -> Word {
         // build the hasher state based on the value of the least significant bit of the index
         let index_bit = *index & 1;
@@ -486,7 +518,9 @@ impl Hasher {
         // add the lookup for the hash initialization if this is the beginning.
         let context = HasherLookupContext::Start;
         if let Some(label) = get_selector_context_label(init_selectors, context) {
-            self.append_lookup(label, Felt::new(*index), context);
+            let lookup_addr = self.get_lookup_addr(context);
+            let lookup_start = HasherLookup::new(label, lookup_addr, Felt::new(*index), context);
+            lookups.push(lookup_start);
         }
 
         // determine values for the node index column for this permutation. if the first selector
@@ -514,7 +548,9 @@ impl Hasher {
         // add the lookup for the hash result if this is the end.
         let context = HasherLookupContext::Return;
         if let Some(label) = get_selector_context_label(final_selectors, context) {
-            self.append_lookup(label, Felt::new(*index), context);
+            let lookup_addr = self.get_lookup_addr(context);
+            let lookup_end = HasherLookup::new(label, lookup_addr, Felt::new(*index), context);
+            lookups.push(lookup_end);
         }
 
         get_digest(&state)
