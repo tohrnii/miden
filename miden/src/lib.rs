@@ -15,3 +15,4 @@ pub use vm_core::{
     errors::{AdviceSetError, InputError},
     AdviceSet, Program, ProgramInputs,
 };
+pub use stdlib;
